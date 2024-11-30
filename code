@@ -1,0 +1,293 @@
+#include <TinyGPS++.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+#define RXD2 16
+#define TXD2 17
+#define GPS_BAUD 9600
+#define LED_BUILTIN 2
+#define BUTTON_PIN 5  // D5 (GPIO5)
+
+// Definição das duas redes Wi-Fi
+const char* ssid1 = "Gabriel";
+const char* password1 = "123456789";
+
+const char* tagoioToken = "3a2490c3-cccc-41fc-a7df-69089d58e17e";
+const char* tagoioUrl = "https://api.tago.io/data";
+
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 5000;
+
+float lastLat = 0, lastLon = 0;
+float totalDistance = 0;
+const float pricePerKm = 0.50;
+
+bool isCountingActive = false;
+unsigned long buttonPressStartTime = 0;
+const unsigned long longPressDuration = 5000;
+
+bool isGPSDataValid = false;
+
+unsigned long lastBlinkTime = 0;
+const unsigned long blinkInterval = 2000; // 2 segundos
+
+bool sendFinalValues = false;
+float finalDistance = 0;
+float finalCost = 0;
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
+  
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  Serial.println("ESP32 com Tarifação Automática e Rastreador");
+  Serial.println("Inicializando...");
+  
+  connectToWiFi();
+}
+
+void loop() {
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+  
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastSendTime >= sendInterval) {
+    lastSendTime = currentMillis;
+    updateDistance();
+    sendDataToTagoIO();
+    displayInfo();
+  }
+  
+  handleButton();
+
+  if (isCountingActive) {
+    digitalWrite(LED_BUILTIN, HIGH);
+  } else {
+    if (currentMillis - lastBlinkTime >= blinkInterval) {
+      lastBlinkTime = currentMillis;
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    }
+  }
+  
+  if (millis() > 5000 && gps.charsProcessed() < 10) {
+    Serial.println("Nenhum dado GPS recebido. Verifique a conexão.");
+    isGPSDataValid = false;
+    delay(5000);
+  } else {
+    isGPSDataValid = gps.location.isValid();
+  }
+}
+
+bool connectToWiFi() {
+  WiFi.mode(WIFI_STA);
+  
+  // Tenta conectar à primeira rede
+  Serial.print("Conectando à rede: ");
+  Serial.println(ssid1);
+  WiFi.begin(ssid1, password1);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConectado à rede: " + String(ssid1));
+    Serial.print("Endereço IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  
+  // Se falhou, tenta conectar à segunda rede
+  Serial.println("\nFalha ao conectar à primeira rede. Tentando a segunda rede.");
+  Serial.print("Conectando à rede: ");
+  Serial.println(ssid2);
+  WiFi.begin(ssid2, password2);
+  
+  attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConectado à rede: " + String(ssid2));
+    Serial.print("Endereço IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  
+  Serial.println("\nFalha ao conectar a ambas as redes Wi-Fi.");
+  return false;
+}
+
+void handleButton() {
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    if (!isCountingActive) {
+      isCountingActive = true;
+      totalDistance = 0;
+      digitalWrite(LED_BUILTIN, HIGH);
+      Serial.println("Iniciando contagem de distância");
+      buttonPressStartTime = millis();
+    } else {
+      if (millis() - buttonPressStartTime >= longPressDuration) {
+        isCountingActive = false;
+        finalDistance = totalDistance;
+        finalCost = finalDistance * pricePerKm;
+        sendFinalValues = true;
+        Serial.println("Contagem de distância finalizada");
+        while (digitalRead(BUTTON_PIN) == LOW) {
+          delay(10);
+        }
+      }
+    }
+  } else {
+    buttonPressStartTime = 0;
+  }
+}
+
+void sendDataToTagoIO() {
+   HTTPClient http;
+   http.begin(tagoioUrl);
+   http.addHeader("Content-Type", "application/json");
+   http.addHeader("Device-Token", tagoioToken);
+
+   DynamicJsonDocument doc(1024);
+   JsonArray array = doc.to<JsonArray>();
+   
+   JsonObject gpsStatusObj = array.createNestedObject();
+   gpsStatusObj["variable"] = "gps_status";
+   gpsStatusObj["value"] = isGPSDataValid ? "Online" : "Offline";
+
+   JsonObject countingStatusObj = array.createNestedObject();
+   countingStatusObj["variable"] = "counting_status";
+   countingStatusObj["value"] = isCountingActive ? "Ativo" : "Inativo";
+
+   if (isGPSDataValid) {
+     JsonObject locationObj = array.createNestedObject();
+     locationObj["variable"] = "location";
+     locationObj["value"] = "GPS Location";
+     JsonObject location = locationObj.createNestedObject("location");
+     location["lat"] = gps.location.lat();
+     location["lng"] = gps.location.lng();
+
+     JsonObject speedObj = array.createNestedObject();
+     speedObj["variable"] = "speed";
+     speedObj["value"] = gps.speed.kmph();
+     speedObj["unit"] = "km/h";
+   }
+
+   JsonObject distanceObj = array.createNestedObject();
+   distanceObj["variable"] = "total_distance";
+   distanceObj["value"] = totalDistance;
+   distanceObj["unit"] = "km";
+
+   JsonObject costObj = array.createNestedObject();
+   costObj["variable"] = "total_cost";
+   costObj["value"] = totalDistance * pricePerKm;
+   costObj["unit"] = "R$";
+
+   if (sendFinalValues) {
+     JsonObject finalDistanceObj = array.createNestedObject();
+     finalDistanceObj["variable"] = "distancia_final";
+     finalDistanceObj["value"] = finalDistance;
+     finalDistanceObj["unit"] = "km";
+
+     JsonObject finalCostObj = array.createNestedObject();
+     finalCostObj["variable"] = "valor_final";
+     finalCostObj["value"] = finalCost;
+     finalCostObj["unit"] = "R$";
+
+     sendFinalValues = false;
+   }
+
+   String payload;
+   serializeJson(doc, payload);
+
+   int httpResponseCode = http.POST(payload);
+
+   if (httpResponseCode > 0) {
+     String response = http.getString();
+     Serial.println("Resposta HTTP: " + String(httpResponseCode));
+     Serial.println(response);
+   } else {
+     Serial.print("Erro no envio HTTP: ");
+     Serial.println(httpResponseCode);
+   }
+
+   http.end();
+}
+
+void updateDistance() {
+   if (gps.location.isValid()) {
+     float currentLat = gps.location.lat();
+     float currentLon = gps.location.lng();
+
+     if (lastLat != 0 && lastLon != 0) {
+       float distance = calcular_distancia(lastLat, lastLon, currentLat, currentLon);
+       if (isCountingActive) {
+         totalDistance += distance;
+       }
+     }
+
+     lastLat = currentLat;
+     lastLon = currentLon;
+   }
+}
+
+float calcular_distancia(float lat1, float lon1, float lat2, float lon2) {
+   lat1 = radians(lat1);
+   lon1 = radians(lon1);
+   lat2 = radians(lat2);
+   lon2 = radians(lon2);
+
+   float dlat = lat2 - lat1;
+   float dlon = lon2 - lon1;
+   float a = sin(dlat/2) * sin(dlat/2) + cos(lat1) * cos(lat2) * sin(dlon/2) * sin(dlon/2);
+   float c = 2 * atan2(sqrt(a), sqrt(1-a));
+   float r = 6371; // Raio da Terra em quilômetros
+   return r * c;
+}
+
+void calculateTotalCost() {
+   float totalCost = totalDistance * pricePerKm;
+   Serial.print("Distância total percorrida: ");
+   Serial.print(totalDistance, 3);
+   Serial.println(" km");
+   Serial.print("Custo total: R$ ");
+   Serial.println(totalCost, 2);
+}
+
+void displayInfo() {
+   Serial.println("--------------------");
+   
+   if(gps.location.isValid()) {
+     Serial.print("Localização: ");
+     Serial.print(gps.location.lat(), 6);
+     Serial.print(",");
+     Serial.println(gps.location.lng(), 6);
+     Serial.print("Velocidade: ");
+     Serial.print(gps.speed.kmph());
+     Serial.println(" km/h");
+   } else {
+     Serial.println("Localização: Não disponível");
+     Serial.println("Velocidade: Não disponível");
+   }
+   Serial.print("Distância total: ");
+   Serial.print(totalDistance, 3);
+   Serial.println(" km");
+
+   calculateTotalCost();
+
+   Serial.println("--------------------");
+}
